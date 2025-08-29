@@ -1,0 +1,98 @@
+// app/api/complete/route.ts
+import { NextResponse } from 'next/server';
+import { supabaseServer } from '@/lib/supabaseServer';
+import { supabaseAdmin } from '@/lib/supabaseAdmin';
+
+const SYSTEM_PROMPTS = {
+  code: `Eres un programador senior full-stack y quant dev experto en MQL4/MQL5, PineScript, Python, JS/TS.
+- Escribe código limpio y autocontenido.
+- En MQL5/MQL4 usa buenas prácticas (OnInit/OnTick, gestión de riesgo, ATR).
+- No alucines imports; si asumes, crea stubs mínimos.
+- Responde SOLO con el texto a insertar (sin backticks).`,
+  smc: `Eres SMC trader institucional.
+- Detecta Liquidez (Equal High/Low), BOS, CHoCH, OB, FVG, Mitigaciones.
+- Identifica fase (Acumulación/Distribución/Manipulación/Expansión).
+- Sugiere acción del bot (activar/pausar, timeframe, POIs, SL institucional, TPs).
+- Responde operativo y conciso.`,
+  mkt: `Eres growth marketer/UX copywriter.
+- Entrega bloques HTML/Tailwind listos para pegar.
+- Tono profesional con energía; CTA claros.
+- Responde SOLO con el bloque a insertar.`
+};
+
+export async function POST(req) {
+  let text = '';
+  try {
+    const { language='plaintext', filename='scratch.txt', prefix='', suffix='', cursor, mode='code', temperature=0.2, max_tokens=128, userInstruction='' } = await req.json();
+
+    const supabase = supabaseServer();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return NextResponse.json({ error: 'No auth' }, { status: 401 });
+
+    // Descuenta 1 crédito de forma atómica
+    const { data: updated, error: updErr } = await supabaseAdmin
+      .from('usage_credits')
+      .update({ credits: undefined })
+      .eq('user_id', user.id)
+      .select('credits')
+      .single();
+
+    // Hacemos el update atómico manualmente:
+    const { data: consume, error: consumeErr } = await supabaseAdmin.rpc('consume_one_credit', { p_user_id: user.id });
+
+    if (consumeErr) {
+      return NextResponse.json({ error: 'Sin créditos' }, { status: 402 });
+    }
+    if (consume?.remaining < 0) {
+      return NextResponse.json({ error: 'Sin créditos' }, { status: 402 });
+    }
+
+    const system = SYSTEM_PROMPTS[mode] ?? SYSTEM_PROMPTS.code;
+    const userPrompt =
+`You are providing inline code suggestion.
+Mode: ${mode}
+Language: ${language}
+Filename: ${filename}
+Cursor: ${cursor?.lineNumber ?? 0}:${cursor?.column ?? 0}
+--- FILE PREFIX START ---
+${prefix}
+--- FILE PREFIX END ---
+--- FILE SUFFIX START ---
+${suffix}
+--- FILE SUFFIX END ---
+User goal: ${userInstruction || 'continue code / next logical lines'}
+Respond with ONLY the raw suggested text to insert at the cursor. No explanations, no backticks.`;
+
+    const provider = (process.env.PROVIDER || 'openai').toLowerCase();
+    let text = '';
+
+   if (provider === 'openai') {
+  text = data.choices?.[0]?.message?.content || '';
+} else if (provider === 'ollama') {
+  const r = await fetch(`${process.env.OLLAMA_URL || 'http://localhost:11434'}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b',
+      prompt: `${system}\n\n${userPrompt}`,
+      options: { temperature },
+      stream: false,
+    }),
+  });
+  if (!r.ok) throw new Error(`Ollama error ${r.status}`);
+  const data = await r.json();
+  text = data.response || '';
+} else {
+      throw new Error('PROVIDER inválido');
+    }
+
+    text = String(text).replace(/^```[\s\S]*?```/g, '').trim();
+
+    return NextResponse.json({ text });
+  } catch (e) {
+    if (e.message?.includes('Sin créditos')) {
+      return NextResponse.json({ error: 'Sin créditos' }, { status: 402 });
+    }
+    return NextResponse.json({ error: e.message || 'Error' }, { status: 500 });
+  }
+}
